@@ -1,4 +1,4 @@
-# Pulse
+# <img src="Artwork/Pulse.svg" width="40" height="40" alt=""> Pulse
 
 A small macOS dashboard and menu-bar companion for the subscription accounts you use in T3 Code.
 

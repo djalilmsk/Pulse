@@ -1,8 +1,10 @@
 import AppKit
+@preconcurrency import ApplicationServices
 import CryptoKit
 import Combine
 import Charts
 import CoreText
+import QuartzCore
 import SwiftUI
 import UserNotifications
 
@@ -2638,6 +2640,8 @@ struct Dashboard: View {
     @State private var showingRotation = false
     @ObservedObject var state: DashboardState
     var playsInitialReveal = false
+    var isEmbeddedOverlay = false
+    var dismissOverlay: (() -> Void)?
     @AppStorage("showAntigravitySharedModels") private var sharedModelsExpanded = false
     @State private var layoutOptions = false
 
@@ -2657,8 +2661,9 @@ struct Dashboard: View {
         .background(dashboardSurface)
         .foregroundStyle(.white)
         .preferredColorScheme(.dark)
-        .frame(width: dashboardWidth)
-        .frame(minHeight: 430, maxHeight: .infinity)
+        .frame(width: isEmbeddedOverlay ? nil : dashboardWidth)
+        .frame(maxWidth: isEmbeddedOverlay ? .infinity : nil,
+               minHeight: isEmbeddedOverlay ? 0 : 430, maxHeight: .infinity)
     }
 
     private func dashboardScroll(now: Date) -> some View {
@@ -2838,9 +2843,21 @@ struct Dashboard: View {
             .sheet(isPresented: $showingAbout) {
                 aboutPulse
             }
+            if isEmbeddedOverlay {
+                Button {
+                    dismissOverlay?()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 11, weight: .semibold))
+                        .modifier(PulseToolbarHover())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Close Usage")
+                .help("Close Usage (Escape)")
+            }
         }
         .font(.caption)
-        .padding(.leading, 96)
+        .padding(.leading, isEmbeddedOverlay ? dashboardInset : 96)
         .padding(.trailing, dashboardInset)
         .frame(height: dashboardToolbarHeight)
     }
@@ -3154,6 +3171,7 @@ private struct WindowDefaults: NSViewRepresentable {
             chromeObservers = []
             configuredWindow = window
             guard let window else { return }
+            PulseScreenPrivacy.applySaved(to: window)
             window.isRestorable = false
             let visibleHeight = window.screen?.visibleFrame.height ?? 740
             let titleBarHeight = window.frame.height - window.contentRect(forFrameRect: window.frame).height
@@ -3348,6 +3366,8 @@ private struct RefreshDetails: View {
 struct ProviderLayoutOptions: View {
     @ObservedObject var state: DashboardState
     @AppStorage(PulseDock.preferenceKey) private var showsDockIcon = false
+    @AppStorage(PulseScreenPrivacy.preferenceKey) private var hideFromScreenShare = false
+    @AppStorage("pulseAttachToT3Usage") private var attachToT3Usage = false
     private struct Drag {
         let driver: String
         let translation: CGFloat
@@ -3396,7 +3416,36 @@ struct ProviderLayoutOptions: View {
             Toggle("Show in Dock", isOn: $showsDockIcon)
                 .toggleStyle(PulseDockSwitch())
                 .onChange(of: showsDockIcon) { _, visible in PulseDock.apply(visible) }
-            .padding(.horizontal, 1)
+                .padding(.horizontal, 1)
+            Toggle("Hide from screen sharing", isOn: $hideFromScreenShare)
+                .toggleStyle(PulseDockSwitch())
+                .help("Full-display capture with ScreenCaptureKit may still show Pulse.")
+                .onChange(of: hideFromScreenShare) { _, hidden in PulseScreenPrivacy.apply(hidden) }
+            Toggle("Show inside T3 Code", isOn: Binding(
+                get: { attachToT3Usage },
+                set: { enabled in
+                    attachToT3Usage = enabled
+                    T3OverlayController.shared.setEnabled(enabled, promptIfNeeded: enabled)
+                }
+            ))
+            .toggleStyle(PulseDockSwitch())
+            if attachToT3Usage {
+                TimelineView(.periodic(from: .now, by: 1)) { _ in
+                    if !AXIsProcessTrusted() {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Accessibility permission required")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Button("Open Accessibility Settings") {
+                                if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+                                    NSWorkspace.shared.open(url)
+                                }
+                            }
+                            .controlSize(.small)
+                        }
+                    }
+                }
+            }
         }
         .font(.callout)
         .padding(13)
@@ -3609,8 +3658,14 @@ final class PulseStatusController: NSObject, ObservableObject, NSPopoverDelegate
                 NSApp.activate(ignoringOtherApps: true)
             })
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-            if popover.isShown { observeDismissal() }
-            else { popover.contentViewController = nil }
+            if popover.isShown {
+                if let window = popover.contentViewController?.view.window {
+                    PulseScreenPrivacy.applySaved(to: window)
+                }
+                observeDismissal()
+            } else {
+                popover.contentViewController = nil
+            }
         }
     }
 
@@ -3660,9 +3715,699 @@ private enum PulseDock {
     }
 }
 
+@MainActor
+private enum PulseScreenPrivacy {
+    static let preferenceKey = "pulseHideFromScreenShare"
+
+    static func apply(_ hidden: Bool) {
+        for window in NSApp.windows {
+            window.sharingType = hidden ? .none : .readOnly
+        }
+    }
+
+    static func applySaved(to window: NSWindow) {
+        window.sharingType = UserDefaults.standard.bool(forKey: preferenceKey) ? .none : .readOnly
+    }
+}
+
+@MainActor
+private final class T3OverlayPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+
+    init(state: DashboardState, frame: NSRect, dismiss: @escaping () -> Void) {
+        super.init(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel],
+                   backing: .buffered, defer: false)
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = true
+        hidesOnDeactivate = false
+        becomesKeyOnlyIfNeeded = true
+        level = .floating
+        collectionBehavior = [.fullScreenAuxiliary, .transient, .ignoresCycle]
+        let host = NSHostingView(rootView: Dashboard(state: state, isEmbeddedOverlay: true,
+                                                     dismissOverlay: dismiss))
+        host.sizingOptions = []
+        host.wantsLayer = true
+        host.layer?.backgroundColor = NSColor(white: 0.06, alpha: 1).cgColor
+        host.layer?.cornerRadius = 12
+        host.layer?.borderWidth = 1 / backingScaleFactor
+        host.layer?.borderColor = NSColor.white.withAlphaComponent(0.08).cgColor
+        host.layer?.masksToBounds = true
+        contentView = host
+        PulseScreenPrivacy.applySaved(to: self)
+    }
+
+    func syncFrame(_ frame: NSRect) {
+        let current = self.frame
+        let resized = abs(current.width - frame.width) > 0.5 ||
+            abs(current.height - frame.height) > 0.5
+        let moved = abs(current.minX - frame.minX) > 0.5 ||
+            abs(current.minY - frame.minY) > 0.5
+        guard resized || moved else { return }
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
+        if resized {
+            setFrame(frame, display: false, animate: false)
+        } else {
+            setFrameOrigin(frame.origin)
+        }
+    }
+}
+
+@MainActor
+private final class T3OverlayController {
+    static let shared = T3OverlayController()
+
+    private var state: DashboardState?
+    private var enabled = false
+    private var panel: T3OverlayPanel?
+    private var suppression: (generation: UInt64, until: TimeInterval)?
+    private var openPopovers = Set<ObjectIdentifier>()
+    private var popoverObservers: [NSObjectProtocol] = []
+    private var globalEscapeMonitor: Any?
+    private var globalClickMonitor: Any?
+    private var localEscapeMonitor: Any?
+    private lazy var tracker = T3UsageTracker { [weak self] dialog, frame in
+        self?.update(dialog: dialog, frame: frame)
+    }
+    private var visibleDialog: AXUIElement?
+
+    func install(state: DashboardState) {
+        self.state = state
+        setEnabled(UserDefaults.standard.bool(forKey: "pulseAttachToT3Usage"))
+    }
+
+    func setEnabled(_ enabled: Bool, promptIfNeeded: Bool = false) {
+        guard self.enabled != enabled else { return }
+        self.enabled = enabled
+        if enabled {
+            if promptIfNeeded && !AXIsProcessTrusted() {
+                let options = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
+                AXIsProcessTrustedWithOptions(options)
+            }
+            preparePanel()
+            tracker.start()
+        } else {
+            tracker.stop()
+            suppression = nil
+            hidePanel()
+            panel = nil
+        }
+    }
+
+    private func preparePanel() {
+        guard panel == nil, let state else { return }
+        panel = T3OverlayPanel(state: state, frame: NSRect(x: 0, y: 0, width: 480, height: 640)) { [weak self] in
+            self?.closeUsageDialog()
+        }
+        panel?.contentView?.layoutSubtreeIfNeeded()
+    }
+
+    private func update(dialog: AXUIElement?, frame: NSRect?) {
+        if dialog == nil {
+            suppression = nil
+            hidePanel()
+            return
+        }
+        if let suppression, suppression.generation == tracker.generation,
+           ProcessInfo.processInfo.systemUptime < suppression.until { return }
+        suppression = nil
+        guard enabled, let dialog, let frame else {
+            hidePanel()
+            return
+        }
+        visibleDialog = dialog
+        preparePanel()
+        guard let panel else { return }
+        panel.syncFrame(frame)
+        guard !panel.isVisible else { return }
+        PulseScreenPrivacy.applySaved(to: panel)
+        panel.contentView?.layoutSubtreeIfNeeded()
+        panel.orderFrontRegardless()
+        popoverObservers = [NSPopover.willShowNotification, NSPopover.didCloseNotification].map { name in
+            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
+                MainActor.assumeIsolated {
+                    guard let self, let popover = note.object as? NSPopover else { return }
+                    let id = ObjectIdentifier(popover)
+                    if note.name == NSPopover.willShowNotification {
+                        self.openPopovers.insert(id)
+                    } else {
+                        self.openPopovers.remove(id)
+                    }
+                }
+            }
+        }
+        globalEscapeMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard Self.isEscape(event) else { return }
+            Task { @MainActor in
+                guard let self, self.panel?.isVisible == true, self.tracker.isFrontmost,
+                      self.openPopovers.isEmpty else { return }
+                self.suppression = (self.tracker.generation, ProcessInfo.processInfo.systemUptime + 0.8)
+                self.hidePanel()
+                self.tracker.rescanAfterEscape()
+            }
+        }
+        globalClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, let panel = self.panel, panel.isVisible, self.tracker.isFrontmost,
+                      self.openPopovers.isEmpty else { return }
+                let location = NSEvent.mouseLocation
+                guard !panel.frame.contains(location) else { return }
+                self.suppression = (self.tracker.generation, ProcessInfo.processInfo.systemUptime + 0.8)
+                self.hidePanel()
+                self.tracker.rescanAfterEscape()
+            }
+        }
+        localEscapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard Self.isEscape(event), let self, let panel = self.panel, event.window === panel,
+                  panel.attachedSheet == nil, self.openPopovers.isEmpty else { return event }
+            self.closeUsageDialog()
+            return nil
+        }
+    }
+
+    private nonisolated static func isEscape(_ event: NSEvent) -> Bool {
+        event.keyCode == 53 && event.modifierFlags.intersection([.command, .option, .control, .shift, .function]).isEmpty
+    }
+
+    private func closeUsageDialog() {
+        guard let visibleDialog else { return }
+        suppression = (tracker.generation, ProcessInfo.processInfo.systemUptime + 1)
+        hidePanel()
+        tracker.close(visibleDialog)
+    }
+
+    private func hidePanel() {
+        visibleDialog = nil
+        panel?.orderOut(nil)
+        if let globalEscapeMonitor { NSEvent.removeMonitor(globalEscapeMonitor) }
+        if let globalClickMonitor { NSEvent.removeMonitor(globalClickMonitor) }
+        if let localEscapeMonitor { NSEvent.removeMonitor(localEscapeMonitor) }
+        globalEscapeMonitor = nil
+        globalClickMonitor = nil
+        localEscapeMonitor = nil
+        for token in popoverObservers { NotificationCenter.default.removeObserver(token) }
+        popoverObservers.removeAll()
+        openPopovers.removeAll()
+    }
+}
+
+@MainActor
+private final class T3UsageTracker {
+    private let workspace = NSWorkspace.shared
+    private let update: (AXUIElement?, NSRect?) -> Void
+    private let axQueue = DispatchQueue(label: "com.pulse.t3-overlay.ax", qos: .userInteractive)
+    private var workspaceObservers: [NSObjectProtocol] = []
+    private var polling: Timer?
+    private var pid: pid_t?
+    private var app: AXUIElement?
+    private var observer: AXObserver?
+    private var window: AXUIElement?
+    private var dialog: AXUIElement?
+    private var readInFlight = false
+    private var pendingRead = false
+    private var webArea: AXUIElement?
+    private(set) var generation: UInt64 = 0
+
+    var isFrontmost: Bool {
+        guard let pid, let frontmost = workspace.frontmostApplication else { return false }
+        return frontmost.processIdentifier == pid && !frontmost.isHidden
+    }
+
+    init(update: @escaping (AXUIElement?, NSRect?) -> Void) {
+        self.update = update
+    }
+
+    func start() {
+        let notifications = [NSWorkspace.didLaunchApplicationNotification,
+                             NSWorkspace.didTerminateApplicationNotification,
+                             NSWorkspace.didActivateApplicationNotification,
+                             NSWorkspace.didDeactivateApplicationNotification,
+                             NSWorkspace.didHideApplicationNotification,
+                             NSWorkspace.didUnhideApplicationNotification]
+        workspaceObservers = notifications.map { name in
+            workspace.notificationCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    let changed = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+                    if changed?.processIdentifier == self.pid,
+                       [NSWorkspace.didDeactivateApplicationNotification, NSWorkspace.didHideApplicationNotification,
+                        NSWorkspace.didTerminateApplicationNotification].contains(note.name) {
+                        self.disconnect()
+                    } else {
+                        self.syncFrontmostApplication()
+                    }
+                }
+            }
+        }
+        syncFrontmostApplication()
+    }
+
+    func stop() {
+        for token in workspaceObservers { workspace.notificationCenter.removeObserver(token) }
+        workspaceObservers.removeAll()
+        disconnect()
+    }
+
+    private func syncFrontmostApplication() {
+        guard let frontmost = workspace.frontmostApplication, !frontmost.isHidden,
+              frontmost.bundleIdentifier == "com.t3tools.t3code" else {
+            disconnect()
+            return
+        }
+        if pid != frontmost.processIdentifier {
+            disconnect()
+            pid = frontmost.processIdentifier
+            resetPolling()
+        }
+        requestRead()
+    }
+
+    private func resetPolling() {
+        polling?.invalidate()
+        let timer = Timer(timeInterval: dialog == nil ? 0.03 : 0.05, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.requestRead() }
+        }
+        polling = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func disconnect() {
+        polling?.invalidate()
+        polling = nil
+        if let observer {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
+        }
+        generation &+= 1
+        pendingRead = false
+        observer = nil
+        app = nil
+        window = nil
+        webArea = nil
+        dialog = nil
+        pid = nil
+        update(nil, nil)
+    }
+
+    private func handleNotification(_ name: String, from element: AXUIElement) {
+        let matchesWindow = window.map { CFEqual($0, element) } ?? false
+        let matchesDialog = dialog.map { CFEqual($0, element) } ?? false
+        switch name {
+        case kAXFocusedWindowChangedNotification, kAXMainWindowChangedNotification:
+            generation &+= 1
+            setDialog(nil)
+            update(nil, nil)
+            requestRead()
+        case kAXWindowMiniaturizedNotification, kAXUIElementDestroyedNotification:
+            guard matchesWindow || matchesDialog else { return }
+            generation &+= 1
+            setDialog(nil)
+            if matchesWindow && name == kAXUIElementDestroyedNotification { setWindow(nil) }
+            update(nil, nil)
+            requestRead()
+        case kAXMovedNotification, kAXResizedNotification:
+            guard matchesWindow || matchesDialog else { return }
+            requestRead()
+        case kAXFocusedUIElementChangedNotification, kAXLayoutChangedNotification, kAXWindowDeminiaturizedNotification:
+            requestRead()
+        default:
+            break
+        }
+    }
+
+    private func observeChange(from old: AXUIElement?, to new: AXUIElement?, names: [String]) {
+        guard let observer else { return }
+        axQueue.async {
+            let context = Unmanaged.passUnretained(self).toOpaque()
+            for name in names {
+                if let old { AXObserverRemoveNotification(observer, old, name as CFString) }
+                if let new { AXObserverAddNotification(observer, new, name as CFString, context) }
+            }
+        }
+    }
+
+    private func setWindow(_ next: AXUIElement?) {
+        guard !Self.same(window, next) else { return }
+        setDialog(nil)
+        observeChange(from: window, to: next, names: [
+            kAXWindowMiniaturizedNotification, kAXWindowDeminiaturizedNotification,
+            kAXMovedNotification, kAXResizedNotification, kAXUIElementDestroyedNotification,
+            kAXLayoutChangedNotification
+        ])
+        window = next
+        webArea = nil
+        generation &+= 1
+    }
+
+    private func setDialog(_ next: AXUIElement?) {
+        guard !Self.same(dialog, next) else { return }
+        let old = Self.same(window, dialog) ? nil : dialog
+        let new = Self.same(window, next) ? nil : next
+        if old != nil || new != nil {
+            observeChange(from: old, to: new, names: [
+                kAXUIElementDestroyedNotification, kAXMovedNotification, kAXResizedNotification
+            ])
+        }
+        let cadenceChanged = (dialog == nil) != (next == nil)
+        dialog = next
+        if cadenceChanged { resetPolling() }
+        generation &+= 1
+    }
+
+    private nonisolated static func same(_ first: AXUIElement?, _ second: AXUIElement?) -> Bool {
+        if let first, let second { return CFEqual(first, second) }
+        return first == nil && second == nil
+    }
+
+    private func requestRead() {
+        guard let pid else { return }
+        guard isFrontmost else {
+            disconnect()
+            return
+        }
+        if readInFlight {
+            pendingRead = true
+            return
+        }
+        readInFlight = true
+        let generation = self.generation
+        let app = self.app
+        let window = self.window
+        let dialog = self.dialog
+        let webArea = self.webArea
+
+        axQueue.async { [weak self] in
+            guard let self else { return }
+            guard app != nil || AXIsProcessTrusted() else {
+                DispatchQueue.main.async {
+                    self.finishRead()
+                }
+                return
+            }
+            let application = app ?? AXUIElementCreateApplication(pid)
+            var newObserver: AXObserver?
+            if app == nil {
+                AXUIElementSetMessagingTimeout(application, 0.15)
+                AXObserverCreate(pid, { observer, element, name, context in
+                    guard let context else { return }
+                    MainActor.assumeIsolated {
+                        let tracker = Unmanaged<T3UsageTracker>.fromOpaque(context).takeUnretainedValue()
+                        guard tracker.observer === observer else { return }
+                        tracker.handleNotification(name as String, from: element)
+                    }
+                }, &newObserver)
+            }
+            let result = Self.read(application: application, window: window, webArea: webArea,
+                                   dialog: dialog)
+            let createdObserver = newObserver
+            DispatchQueue.main.async {
+                defer { self.finishRead() }
+                guard self.generation == generation, self.isFrontmost else { return }
+                if self.app == nil {
+                    self.app = application
+                    self.observer = createdObserver
+                    if let createdObserver {
+                        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(createdObserver), .commonModes)
+                        self.observeChange(from: nil, to: application, names: [
+                            kAXFocusedWindowChangedNotification, kAXMainWindowChangedNotification,
+                            kAXFocusedUIElementChangedNotification
+                        ])
+                    }
+                }
+                guard result.geometry.error != .cannotComplete else { return }
+                self.setWindow(result.window)
+                self.webArea = result.webArea
+                if result.geometry.rect == nil {
+                    self.setDialog(nil)
+                    self.update(nil, nil)
+                    if dialog != nil { self.requestRead() }
+                    return
+                }
+                self.setDialog(result.dialog)
+                self.update(result.dialog, result.geometry.rect.flatMap(self.screenFrame))
+            }
+        }
+    }
+
+    private func finishRead() {
+        readInFlight = false
+        if pendingRead {
+            pendingRead = false
+            requestRead()
+        }
+    }
+
+    private struct Geometry {
+        var rect: CGRect? = nil
+        var error: AXError = .success
+    }
+
+    private nonisolated static func read(application: AXUIElement, window: AXUIElement?,
+                                         webArea: AXUIElement?, dialog: AXUIElement?)
+        -> (window: AXUIElement?, webArea: AXUIElement?, dialog: AXUIElement?, geometry: Geometry) {
+        if let dialog { return (window, webArea, dialog, geometry(of: dialog)) }
+        var value: CFTypeRef?
+        let focusError = AXUIElementCopyAttributeValue(application, kAXFocusedWindowAttribute as CFString, &value)
+        if focusError == .cannotComplete { return (window, webArea, nil, Geometry(error: focusError)) }
+        guard focusError == .success, let value, CFGetTypeID(value) == AXUIElementGetTypeID()
+        else { return (nil, nil, nil, Geometry()) }
+        let focused = value as! AXUIElement
+        let area = (same(window, focused) ? webArea : nil) ?? findWebArea(in: focused)
+        guard attribute(kAXMinimizedAttribute, of: focused) != true else {
+            return (focused, area, nil, Geometry())
+        }
+        let usage = usageDialog(in: focused, webArea: area)
+        return (focused, area, usage?.dialog, usage?.geometry ?? Geometry())
+    }
+
+    func rescanAfterEscape() {
+        requestRead()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self, generation] in
+            guard let self, self.generation == generation else { return }
+            self.requestRead()
+        }
+    }
+
+    func close(_ target: AXUIElement) {
+        guard isFrontmost, let pid else { return }
+        postEscape(pid: pid, generation: generation)
+    }
+
+    private func pressCloseButton(_ button: AXUIElement, target: AXUIElement,
+                                  pid: pid_t, generation: UInt64) {
+        axQueue.async { [weak self] in
+            guard AXUIElementPerformAction(button, kAXPressAction as CFString) == .success else {
+                DispatchQueue.main.async { self?.postEscape(pid: pid, generation: generation) }
+                return
+            }
+            self?.axQueue.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+                let remaining = Self.geometry(of: target)
+                DispatchQueue.main.async {
+                    guard let self, self.generation == generation, self.isFrontmost else { return }
+                    if remaining.rect != nil {
+                        self.postEscape(pid: pid, generation: generation)
+                    } else {
+                        self.requestRead()
+                    }
+                }
+            }
+        }
+    }
+
+    private func postEscape(pid: pid_t, generation: UInt64) {
+        guard self.generation == generation, isFrontmost, self.pid == pid,
+              let down = CGEvent(keyboardEventSource: nil, virtualKey: 53, keyDown: true),
+              let up = CGEvent(keyboardEventSource: nil, virtualKey: 53, keyDown: false) else { return }
+        down.postToPid(pid)
+        up.postToPid(pid)
+        rescanAfterEscape()
+    }
+
+    private nonisolated static func closeButton(in dialog: AXUIElement) -> AXUIElement? {
+        if let button: AXUIElement = attribute(kAXCloseButtonAttribute, of: dialog),
+           isCloseButton(button) { return button }
+        var elements = [dialog]
+        var index = 0
+        while index < elements.count {
+            let element = elements[index]
+            index += 1
+            if isCloseButton(element) { return element }
+            if elements.count < 150 {
+                let children: [AXUIElement] = attribute(kAXChildrenAttribute, of: element) ?? []
+                elements.append(contentsOf: children.prefix(150 - elements.count))
+            }
+        }
+        return nil
+    }
+
+    private nonisolated static func isCloseButton(_ element: AXUIElement) -> Bool {
+        let role: String? = attribute(kAXRoleAttribute, of: element)
+        guard role == kAXButtonRole else { return false }
+        let subrole: String? = attribute(kAXSubroleAttribute, of: element)
+        let namedClose = subrole == kAXCloseButtonSubrole ||
+            [kAXTitleAttribute, kAXDescriptionAttribute].contains {
+                let name: String? = attribute($0, of: element)
+                return name?.caseInsensitiveCompare("Close") == .orderedSame
+            }
+        guard namedClose, attribute(kAXEnabledAttribute, of: element) == true else { return false }
+        var actions: CFArray?
+        return AXUIElementCopyActionNames(element, &actions) == .success &&
+            (actions as? [String])?.contains(kAXPressAction) == true
+    }
+
+    private nonisolated static func findWebArea(in window: AXUIElement) -> AXUIElement? {
+        var nodes = [(element: window, depth: 0)]
+        var index = 0
+        while index < nodes.count {
+            let (element, depth) = nodes[index]
+            index += 1
+            let role: String? = attribute(kAXRoleAttribute, of: element)
+            if role == "AXWebArea" { return element }
+            switch role {
+            case kAXWindowRole, kAXGroupRole, kAXSplitGroupRole, kAXScrollAreaRole, "AXUnknown":
+                if depth < 12, nodes.count < 40 {
+                    nodes.append(contentsOf: children(of: element).prefix(40 - nodes.count).map { ($0, depth + 1) })
+                }
+            default:
+                break
+            }
+        }
+        return nil
+    }
+
+    private nonisolated static func usageDialog(in window: AXUIElement, webArea: AXUIElement?)
+        -> (dialog: AXUIElement, geometry: Geometry)? {
+        if let webArea {
+            for element in children(of: webArea).reversed() {
+                let role: String? = attribute(kAXRoleAttribute, of: element)
+                if let match = usageDialog(element, role: role) { return match }
+                if role == kAXGroupRole {
+                    for child in children(of: element).reversed() {
+                        let childRole: String? = attribute(kAXRoleAttribute, of: child)
+                        if let match = usageDialog(child, role: childRole) { return match }
+                        if childRole == kAXGroupRole {
+                            for grandchild in children(of: child).reversed() {
+                                if let match = usageDialog(grandchild, role: attribute(kAXRoleAttribute, of: grandchild)) {
+                                    return match
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        var nodes = [(element: webArea ?? window, depth: 0)]
+        var index = 0
+        let maxDepth = webArea == nil ? 12 : 5
+        while index < nodes.count {
+            let (element, depth) = nodes[index]
+            index += 1
+            let role: String? = attribute(kAXRoleAttribute, of: element)
+            if let match = usageDialog(element, role: role) { return match }
+            switch role {
+            case kAXScrollAreaRole, kAXListRole, kAXTableRole, kAXStaticTextRole, kAXTextAreaRole, kAXImageRole:
+                continue
+            default:
+                if depth < maxDepth, nodes.count < 80 {
+                    nodes.append(contentsOf: children(of: element).reversed().prefix(80 - nodes.count)
+                        .map { ($0, depth + 1) })
+                }
+            }
+        }
+        return nil
+    }
+
+    private nonisolated static func usageDialog(_ element: AXUIElement, role: String?)
+        -> (dialog: AXUIElement, geometry: Geometry)? {
+        guard role == kAXGroupRole || role == kAXWindowRole || role == kAXSheetRole || role == "AXDialog"
+        else { return nil }
+        let subrole: String? = attribute(kAXSubroleAttribute, of: element)
+        let isDialog = subrole == "AXApplicationDialog" || subrole == "AXDialog" ||
+            role == "AXDialog" || role == kAXSheetRole
+        guard isDialog || role == kAXGroupRole else { return nil }
+        let namedUsage = [kAXTitleAttribute, kAXDescriptionAttribute].contains {
+            let name: String? = attribute($0, of: element)
+            return name == "Usage"
+        }
+        guard namedUsage || (isDialog && children(of: element).contains(where: isUsageHeading)) else { return nil }
+        let frame = geometry(of: element)
+        return frame.rect == nil ? nil : (element, frame)
+    }
+
+    private nonisolated static func children(of element: AXUIElement) -> [AXUIElement] {
+        attribute(kAXChildrenAttribute, of: element) ?? []
+    }
+
+    private nonisolated static func isUsageHeading(_ element: AXUIElement) -> Bool {
+        let role: String? = attribute(kAXRoleAttribute, of: element)
+        guard role == "AXHeading" || role == kAXStaticTextRole else { return false }
+        let title: String? = attribute(kAXTitleAttribute, of: element)
+        let value: String? = attribute(kAXValueAttribute, of: element)
+        return title == "Usage" || value == "Usage"
+    }
+
+    private nonisolated static func attribute<T>(_ name: String, of element: AXUIElement) -> T? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success else { return nil }
+        return value as? T
+    }
+
+    private nonisolated static func geometry(of element: AXUIElement) -> Geometry {
+        let names = [kAXPositionAttribute, kAXSizeAttribute, kAXParentAttribute]
+        var values: CFArray?
+        let error = AXUIElementCopyMultipleAttributeValues(element, names as CFArray, [], &values)
+        guard error == .success else { return Geometry(error: error) }
+        guard let values = values as? [CFTypeRef], values.count == names.count,
+              CFGetTypeID(values[2]) == AXUIElementGetTypeID() else { return Geometry() }
+        if let rect = geometry(position: values[0], size: values[1]) {
+            return Geometry(rect: rect)
+        }
+        for value in values.prefix(2) where CFGetTypeID(value) == AXValueGetTypeID() {
+            var attributeError = AXError.success
+            if AXValueGetValue(value as! AXValue, .axError, &attributeError),
+               attributeError == .invalidUIElement || attributeError == .cannotComplete {
+                return Geometry(error: attributeError)
+            }
+        }
+        return Geometry()
+    }
+
+    private nonisolated static func geometry(position: CFTypeRef?, size: CFTypeRef?) -> CGRect? {
+        guard let position, let size,
+              CFGetTypeID(position) == AXValueGetTypeID(), CFGetTypeID(size) == AXValueGetTypeID()
+        else { return nil }
+        var origin = CGPoint.zero
+        var dimensions = CGSize.zero
+        guard AXValueGetValue(position as! AXValue, .cgPoint, &origin),
+              AXValueGetValue(size as! AXValue, .cgSize, &dimensions),
+              dimensions.width > 0, dimensions.height > 0 else { return nil }
+        return CGRect(origin: origin, size: dimensions)
+    }
+
+    private func screenFrame(_ frame: CGRect) -> NSRect? {
+        guard let primaryScreen = NSScreen.screens.first else { return nil }
+        let rect = NSRect(x: frame.minX, y: primaryScreen.frame.maxY - frame.maxY,
+                          width: frame.width, height: frame.height)
+        return NSScreen.screens.contains { $0.frame.intersects(rect) } ? rect : nil
+    }
+}
+
 final class PulseAppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         PulseDock.apply(UserDefaults.standard.bool(forKey: PulseDock.preferenceKey))
+        PulseScreenPrivacy.apply(UserDefaults.standard.bool(forKey: PulseScreenPrivacy.preferenceKey))
+        NotificationCenter.default.addObserver(self, selector: #selector(applyWindowPrivacy),
+                                               name: NSWindow.didBecomeKeyNotification, object: nil)
+    }
+
+    @MainActor @objc private func applyWindowPrivacy(_ notification: Notification) {
+        if let window = notification.object as? NSWindow {
+            PulseScreenPrivacy.applySaved(to: window)
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
@@ -3738,6 +4483,7 @@ struct PulseDashboardScene: View {
         .preferredColorScheme(.dark)
         .background(WindowDefaults())
         .onAppear {
+            T3OverlayController.shared.install(state: state)
             status.install(state: state) { openWindow(id: "dashboard") }
             state.alerts.openDashboard = { openWindow(id: "dashboard") }
             if introSeen { state.startMonitoring() }

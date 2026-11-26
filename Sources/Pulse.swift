@@ -75,6 +75,7 @@ struct Profile: Identifiable, Sendable, Equatable {
     let credits: Int?
     let creditExpiresAt: Date?
     let codexConfig: T3.Config.Codex?
+    let usesDefaultMuseCLI: Bool
     let reading: Snapshot?
 
     var tokenFile: URL { Self.antigravityTokenFile(id) }
@@ -168,8 +169,129 @@ enum QuotaCLI {
     }
 }
 
+private enum MuseQuotaCLI {
+    private struct Usage: Decodable {
+        struct Window: Decodable {
+            let usedPercent: Double
+            let resetsAtMs: Double
+            let windowDurationMins: Double?
+        }
+
+        let observedAtMs: Double
+        let window: Window
+        let weekly: Window
+    }
+
+    static func read(email: String?) -> Snapshot? {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let env = ProcessInfo.processInfo.environment
+        let paths = [home.appendingPathComponent(".local/bin").path, "/opt/homebrew/bin", "/usr/local/bin"]
+            + (env["PATH"] ?? "").split(separator: ":").map(String.init)
+        guard let binary = paths.map({ $0 + "/muse" }).first(where: FileManager.default.isExecutableFile(atPath:)) else {
+            return nil
+        }
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: binary)
+        process.arguments = ["usage", "--json"]
+        process.currentDirectoryURL = FileManager.default.temporaryDirectory
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        do { try process.run() } catch { return nil }
+        let timeout = DispatchWorkItem { if process.isRunning { process.terminate() } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 20, execute: timeout)
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        timeout.cancel()
+        guard process.terminationStatus == 0,
+              let usage = try? JSONDecoder().decode(Usage.self, from: data),
+              usage.observedAtMs > 0 else { return nil }
+        let windows = [("session", "Session", usage.window), ("weekly", "Weekly", usage.weekly)]
+        let buckets = windows.compactMap { id, name, window -> Bucket? in
+            guard window.usedPercent >= 0, window.resetsAtMs > 0 else { return nil }
+            let reset = Date(timeIntervalSince1970: window.resetsAtMs / 1000)
+            return Bucket(id: id, name: name, remainingFraction: max(0, 1 - window.usedPercent / 100),
+                          resetTime: ISO8601DateFormatter().string(from: reset),
+                          durationMinutes: id == "weekly" ? 10080 : window.windowDurationMins)
+        }
+        guard !buckets.isEmpty else { return nil }
+        return Snapshot(email: email ?? "", captured: Date(timeIntervalSince1970: usage.observedAtMs / 1000),
+                        groups: [QuotaGroup(name: "Subscription", buckets: buckets)])
+    }
+}
+
 enum T3 {
     static let root = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".t3")
+
+    private struct Runtime: Decodable {
+        let port: Int
+    }
+
+    private struct RefreshReply: Decodable {
+        struct Exit: Decodable {
+            let _tag: String
+        }
+
+        let _tag: String
+        let requestId: String?
+        let exit: Exit?
+    }
+
+    static func refreshProviders() async -> Bool {
+        guard let data = try? Data(contentsOf: root.appendingPathComponent("userdata/server-runtime.json")),
+              let runtime = try? JSONDecoder().decode(Runtime.self, from: data),
+              (1...65535).contains(runtime.port),
+              let url = URL(string: "ws://127.0.0.1:\(runtime.port)/ws?orchestrationProtocol=2") else {
+            return false
+        }
+
+        let cli = root.appendingPathComponent("bin/t3")
+        guard FileManager.default.isExecutableFile(atPath: cli.path) else { return false }
+        let process = Process()
+        process.executableURL = cli
+        process.arguments = ["auth", "session", "issue", "--base-dir", root.path,
+                             "--scope", "orchestration:read", "--ttl", "5m",
+                             "--label", "Pulse quota refresh", "--token-only"]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        do { try process.run() } catch { return false }
+        let deadline = DispatchWorkItem { if process.isRunning { process.terminate() } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 20, execute: deadline)
+        let bytes = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        deadline.cancel()
+        guard process.terminationStatus == 0,
+              let token = String(data: bytes, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !token.isEmpty, token.rangeOfCharacter(from: .whitespacesAndNewlines) == nil else { return false }
+
+        var request = URLRequest(url: url)
+        request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization")
+        let session = URLSession(configuration: .ephemeral)
+        let socket = session.webSocketTask(with: request)
+        let timeout = Task {
+            do { try await Task.sleep(for: .seconds(45)) } catch { return }
+            socket.cancel(with: .goingAway, reason: nil)
+        }
+        defer {
+            timeout.cancel()
+            session.invalidateAndCancel()
+        }
+        socket.resume()
+        do {
+            try await socket.send(.string(#"{"_tag":"Request","id":"0","tag":"server.refreshProviders","payload":{},"headers":[]}"#))
+            while case .string(let message) = try await socket.receive() {
+                if let reply = try? JSONDecoder().decode(RefreshReply.self, from: Data(message.utf8)),
+                   reply._tag == "Exit", reply.requestId == "0" {
+                    return reply.exit?._tag == "Success"
+                }
+            }
+        } catch {
+            return false
+        }
+        return false
+    }
 
     struct Config: Decodable {
         struct Codex: Decodable, Sendable, Equatable {
@@ -179,10 +301,33 @@ enum T3 {
             let launchArgs: String?
         }
         let config: Codex?
+        let usesDefaultMuseCLI: Bool
         let driver: String
         let enabled: Bool?
         let displayName: String?
         let accentColor: String?
+
+        private enum MuseKeys: String, CodingKey { case binaryPath }
+
+        private enum CodingKeys: String, CodingKey {
+            case config, driver, enabled, displayName, accentColor
+        }
+
+        init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            driver = try values.decode(String.self, forKey: .driver)
+            enabled = try values.decodeIfPresent(Bool.self, forKey: .enabled)
+            displayName = try values.decodeIfPresent(String.self, forKey: .displayName)
+            accentColor = try values.decodeIfPresent(String.self, forKey: .accentColor)
+            config = driver == "codex" ? try values.decodeIfPresent(Codex.self, forKey: .config) : nil
+            if driver == "muse" {
+                let settings = try? values.nestedContainer(keyedBy: MuseKeys.self, forKey: .config)
+                let binary = try? settings?.decodeIfPresent(String.self, forKey: .binaryPath)
+                usesDefaultMuseCLI = binary == nil || binary == "" || binary == "muse"
+            } else {
+                usesDefaultMuseCLI = false
+            }
+        }
     }
 
     struct Settings: Decodable {
@@ -260,7 +405,8 @@ enum T3 {
                            accent: config.accentColor ?? cache?.accentColor, email: googleEmail ?? cache?.auth?.email,
                            plan: cache?.auth?.label, credits: limits?.resetCredits?.availableCount,
                            creditExpiresAt: limits?.resetCredits?.nextExpiresAt.flatMap(parseDate),
-                           codexConfig: config.driver == "codex" ? config.config : nil, reading: reading)
+                           codexConfig: config.config, usesDefaultMuseCLI: id == "muse" && config.usesDefaultMuseCLI,
+                           reading: reading)
         }.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
 
@@ -268,7 +414,14 @@ enum T3 {
         switch driver {
         case "codex": "Codex"
         case "claudeAgent": "Claude"
+        case "cursor": "Cursor"
+        case "opencode": "OpenCode"
+        case "muse": "Muse Code"
+        case "pi": "Pi"
         case "antigravity": "Antigravity"
+        case "grok": "Grok"
+        case "fx": "fx"
+        case "kiro": "Kiro"
         default: driver.prefix(1).uppercased() + driver.dropFirst()
         }
     }
@@ -351,6 +504,7 @@ final class DashboardState: ObservableObject {
     private var monitorTask: Task<Void, Never>?
     private var fileVersions: [URL: Date] = [:]
     private var watchedFiles = [T3.root.appendingPathComponent("userdata/settings.json")]
+    private var refreshingT3Providers = false
     private var antigravityReadingsDirty = false
 
     func startMonitoring() {
@@ -391,7 +545,8 @@ final class DashboardState: ObservableObject {
                 let values = accounts.compactMap { profile -> Double? in
                     guard errors[profile.id] == nil, let snapshot = reading(profile) else { return nil }
                     let groups = snapshot.groups.filter {
-                        driver != "antigravity" || $0.name.localizedCaseInsensitiveContains("Gemini")
+                        driver != "antigravity" || $0.name == "Subscription"
+                            || $0.name.localizedCaseInsensitiveContains("Gemini")
                     }
                     let bucket = groups.flatMap(\.buckets).first {
                         let matches = weekly ? ($0.id == "weekly" || $0.id.hasSuffix("-weekly"))
@@ -412,7 +567,8 @@ final class DashboardState: ObservableObject {
     }
 
     func reading(_ profile: Profile) -> Snapshot? {
-        guard let live = snapshots[profile.id], let email = profile.email,
+        guard let live = snapshots[profile.id],
+              let email = profile.email ?? (profile.usesDefaultMuseCLI ? "" : nil),
               email.caseInsensitiveCompare(live.email) == .orderedSame else {
             return profile.reading
         }
@@ -441,16 +597,31 @@ final class DashboardState: ObservableObject {
     }
 
     func refresh(reloadInventory: Bool = true, includeCodex: Bool = true) async {
-        guard pending.isEmpty else { return }
+        guard pending.isEmpty, !refreshingT3Providers else { return }
         if reloadInventory { readInventory() }
         let cliProfiles = profiles.filter { $0.driver == "antigravity" && $0.reading == nil }
         let codexProfiles = includeCodex ? profiles.filter { $0.driver == "codex" && $0.email != nil } : []
         if !codexProfiles.isEmpty { lastCodexAttempt = .now }
-        pending = Set((cliProfiles + codexProfiles).map(\.id))
+        let t3Profiles = profiles.filter { $0.driver != "codex" && $0.driver != "antigravity" }
+        let t3IDs = Set(t3Profiles.map(\.id))
+        refreshingT3Providers = !t3IDs.isEmpty
+        pending = Set((cliProfiles + codexProfiles).map(\.id)).union(t3IDs)
         if !initialScanFinished { initialScanIDs = pending }
         lastLoad = .now
         nextRefresh = nil
         await withTaskGroup(of: Void.self) { group in
+            if !t3IDs.isEmpty {
+                group.addTask { [weak self] in
+                    var fallback = t3IDs
+                    if let muse = t3Profiles.first(where: \.usesDefaultMuseCLI),
+                       let reading = MuseQuotaCLI.read(email: muse.email) {
+                        await self?.record(muse.id, result: .success(reading))
+                        fallback.remove(muse.id)
+                    }
+                    let refreshed = fallback.isEmpty ? false : await T3.refreshProviders()
+                    await self?.finishT3Refresh(ids: fallback, refreshed: refreshed)
+                }
+            }
             if !cliProfiles.isEmpty {
                 group.addTask { [weak self] in
                     for profile in cliProfiles {
@@ -476,8 +647,14 @@ final class DashboardState: ObservableObject {
             }
             antigravityReadingsDirty = false
         }
-        if !cliProfiles.isEmpty { nextRefresh = Date().addingTimeInterval(300) }
+        if !cliProfiles.isEmpty || !t3IDs.isEmpty { nextRefresh = Date().addingTimeInterval(300) }
         if !initialScanFinished { initialScanFinished = true }
+    }
+
+    private func finishT3Refresh(ids: Set<String>, refreshed: Bool) {
+        if refreshed { readInventory() }
+        pending.subtract(ids)
+        refreshingT3Providers = false
     }
 
     private func record(_ id: String, result: Result<Snapshot, Error>) {
@@ -750,6 +927,7 @@ private let dashboardToolbarHeight: CGFloat = 44
 private let dashboardSurface = Color(red: 0.07, green: 0.08, blue: 0.10)
 
 struct Dashboard: View {
+    @State private var showingAbout = false
     @ObservedObject var state: DashboardState
     var playsInitialReveal = false
     @AppStorage("showAntigravitySharedModels") private var sharedModelsExpanded = false
@@ -794,21 +972,68 @@ struct Dashboard: View {
         .frame(minHeight: 430, maxHeight: .infinity)
     }
 
+    private var aboutPulse: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("About Pulse")
+                .font(.title2.bold())
+                .accessibilityAddTraits(.isHeader)
+            Text("Pulse brings quota balances and reset times for your T3 Code accounts into one dashboard and menu bar summary.")
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Supported providers")
+                    .font(.headline)
+                    .accessibilityAddTraits(.isHeader)
+                let providers = ["codex", "claudeAgent", "cursor", "opencode",
+                                 "muse", "pi", "antigravity", "grok"]
+                let border = Color.white.opacity(0.16)
+                VStack(spacing: 0) {
+                    ForEach(0..<2) { row in
+                        if row > 0 { Rectangle().fill(border).frame(height: 1) }
+                        HStack(spacing: 0) {
+                            ForEach(0..<4) { column in
+                                if column > 0 { Rectangle().fill(border).frame(width: 1) }
+                                let driver = providers[row * 4 + column]
+                                VStack(spacing: 6) {
+                                    ProviderMark(driver: driver, size: 20, monochrome: true)
+                                    Text(T3.providerName(driver))
+                                        .font(.caption)
+                                        .lineLimit(1)
+                                }
+                                .padding(.top, 12)
+                                .padding(.bottom, 10)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+                            }
+                        }
+                        .frame(height: 66)
+                    }
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8).strokeBorder(border)
+                }
+                Text("Other enabled providers can appear when T3 Code supplies quota data.")
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Text("Enable accounts in T3 Code to see them in Pulse. Codex, Antigravity, and the default Muse Code account can refresh through their command-line tools. For other accounts, keep T3 Code running so Pulse can ask it for updates. Some tools only show usage during a session or report token totals. Pulse shows quota balances when it can get them.")
+                .foregroundStyle(.secondary)
+
+            HStack {
+                Spacer()
+                Button("Done") { showingAbout = false }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(22)
+        .frame(width: 380, alignment: .leading)
+        .presentationBackground(dashboardSurface)
+    }
+
     private func dashboardHeader(now: Date) -> some View {
         let checking = !state.pending.isEmpty
         return HStack(spacing: 10) {
-            HStack(spacing: 5) {
-                if let mark = PulseArtwork.image("PulseMenu@2x") {
-                    Image(nsImage: mark)
-                        .resizable()
-                        .scaledToFit()
-                        .frame(width: 17, height: 17)
-                        .accessibilityHidden(true)
-                }
-                Text("Pulse")
-                    .font(PulseType.display(17).weight(.semibold))
-                    .accessibilityAddTraits(.isHeader)
-            }
+            PulseWordmark()
             Spacer()
             if state.inventoryError {
                 Label("T3 settings unavailable", systemImage: "exclamationmark.circle")
@@ -853,6 +1078,20 @@ struct Dashboard: View {
             .help("Customize layout")
             .popover(isPresented: $layoutOptions, arrowEdge: .bottom) {
                 ProviderLayoutOptions(state: state)
+            }
+            Button {
+                showingAbout = true
+            } label: {
+                Image(systemName: "exclamationmark.circle")
+                    .font(.system(size: 13, weight: .semibold))
+                    .frame(width: 26, height: 26)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.borderless)
+            .accessibilityLabel("About Pulse")
+            .help("About Pulse and supported providers")
+            .sheet(isPresented: $showingAbout) {
+                aboutPulse
             }
         }
         .font(.caption)
@@ -1053,16 +1292,22 @@ struct MenuQuota: Identifiable {
 private struct ProviderMark: View {
     let driver: String
     let size: CGFloat
+    var monochrome = false
 
     var body: some View {
         Group {
-            if let image = PulseArtwork.image(driver) {
-                Image(nsImage: image).resizable().scaledToFit()
+            if let image = PulseArtwork.image(driver) ?? PulseArtwork.image(driver, extension: "svg") {
+                Image(nsImage: image)
+                    .renderingMode(monochrome && driver != "opencode" ? .template : .original)
+                    .resizable()
+                    .scaledToFit()
             } else {
                 Image(systemName: "square.stack.3d.up")
+                    .symbolRenderingMode(.monochrome)
                     .font(.system(size: size * 0.8))
             }
         }
+        .foregroundStyle(monochrome ? Color.white : Color.primary)
         .frame(width: size, height: size)
         .accessibilityHidden(true)
     }
@@ -1185,6 +1430,23 @@ struct ProviderLayoutOptions: View {
     }
 }
 
+private struct PulseWordmark: View {
+    var body: some View {
+        HStack(spacing: 5) {
+            if let mark = PulseArtwork.image("PulseMenu@2x") {
+                Image(nsImage: mark)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 17, height: 17)
+                    .accessibilityHidden(true)
+            }
+            Text("Pulse")
+                .font(PulseType.display(17).weight(.semibold))
+                .accessibilityAddTraits(.isHeader)
+        }
+    }
+}
+
 struct PulseMenu: View {
     @ObservedObject var state: DashboardState
     let openDashboard: () -> Void
@@ -1194,7 +1456,7 @@ struct PulseMenu: View {
             let summary = state.menuSummary(at: timeline.date)
             VStack(alignment: .leading, spacing: 9) {
                 HStack {
-                    Text("Pulse").font(PulseType.display(20))
+                    PulseWordmark().foregroundStyle(.white)
                     Spacer()
                     if !state.pending.isEmpty {
                         ProgressView().controlSize(.small).accessibilityLabel("Checking quota")
@@ -1719,7 +1981,8 @@ actor CodexReset {
         let input = Pipe()
         let output = Pipe()
         var environment = ProcessInfo.processInfo.environment
-        if let home { environment["CODEX_HOME"] = (home as NSString).expandingTildeInPath }
+        environment["CODEX_HOME"] = home.map { ($0 as NSString).expandingTildeInPath }
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex").path
         process.executableURL = URL(fileURLWithPath: binary)
         process.arguments = ["app-server"]
         process.currentDirectoryURL = FileManager.default.temporaryDirectory

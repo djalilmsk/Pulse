@@ -1,0 +1,30 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="plate" x2="40%" y2="100%">
+      <stop stop-color="#28292b"/>
+      <stop offset="1" stop-color="#141517"/>
+    </linearGradient>
+    <linearGradient id="edge" x2="0%" y2="100%">
+      <stop stop-color="#48494b"/>
+      <stop offset=".5" stop-color="#292a2c"/>
+      <stop offset="1" stop-color="#191a1c"/>
+    </linearGradient>
+    <linearGradient id="silver" x2="22%" y2="100%">
+      <stop stop-color="#f2f3f5"/>
+      <stop offset="1" stop-color="#a9aeb6"/>
+    </linearGradient>
+    <path id="mark" d="M0 2.00011C0 0.895544 0.895422 0.000115998 1.99999 0.000108507L16 1.35635e-05C17.1046 6.07258e-06 18 0.895439 18 2.00001V12.0333C18 13.1379 17.1046 14.0333 16 14.0333H12C10.8954 14.0333 10 13.1379 10 12.0333V9.00012C10 8.44784 9.55229 8.00012 9 8.00012C8.44771 8.00012 8 8.44784 8 9.00012V16.8304C8 17.553 7.61028 18.2193 6.98052 18.5736L2.98052 20.8236C1.64731 21.5735 0 20.6101 0 19.0804V2.00011Z"/>
+    <clipPath id="inside">
+      <path d="M0 2.00011C0 0.895544 0.895422 0.000115998 1.99999 0.000108507L16 1.35635e-05C17.1046 6.07258e-06 18 0.895439 18 2.00001V12.0333C18 13.1379 17.1046 14.0333 16 14.0333H12C10.8954 14.0333 10 13.1379 10 12.0333V9.00012C10 8.44784 9.55229 8.00012 9 8.00012C8.44771 8.00012 8 8.44784 8 9.00012V16.8304C8 17.553 7.61028 18.2193 6.98052 18.5736L2.98052 20.8236C1.64731 21.5735 0 20.6101 0 19.0804V2.00011Z"/>
+    </clipPath>
+  </defs>
+  <rect x="92" y="92" width="840" height="840" rx="206" fill="url(#plate)" stroke="url(#edge)" stroke-width="5"/>
+  <g transform="translate(296 259) scale(24)">
+    <use href="#mark" fill="url(#silver)"/>
+    <g clip-path="url(#inside)" fill="none" stroke="#15181d" stroke-linejoin="round">
+      <use href="#mark" transform="translate(0 -.40)" stroke-width="1.35" opacity=".035"/>
+      <use href="#mark" transform="translate(0 -.31)" stroke-width=".85" opacity=".05"/>
+      <use href="#mark" transform="translate(0 -.23)" stroke-width=".45" opacity=".075"/>
+    </g>
+  </g>
+</svg>

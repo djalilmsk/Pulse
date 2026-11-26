@@ -1,4 +1,4 @@
-# <img align="absmiddle" src="Artwork/Pulse.svg" width="32" height="32" alt=""> Pulse
+# <img align="absmiddle" src="Artwork/PulseMark.svg" width="23" height="28" alt=""> Pulse
 
 A small macOS dashboard and menu-bar companion for the subscription accounts you use in T3 Code.
 

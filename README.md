@@ -22,7 +22,7 @@ With Xcode Command Line Tools installed, run `./scripts/build.sh` and open `dist
 
 ## Updates
 
-Pulse checks for updates automatically. When an update is available, **New update** appears next to the Pulse logo in the dashboard. Use **Check for Updates…** in the Pulse menu to check immediately. Install the first updater-enabled release manually if you're using an older version.
+With automatic update checks enabled, Pulse checks the signed release feed at launch and every minute while running. When it finds an update, **New update** appears next to the Pulse logo in the dashboard. Use **Check for Updates…** in the Pulse menu to check immediately. Install the first updater-enabled release manually if you're using an older version.
 
 For each release, increment both version fields in `Resources/Info.plist` and run `./scripts/build.sh --release`. Upload the generated DMG, ZIP, and `appcast.xml` together to the matching stable GitHub release, such as `v1.11.0`. The DMG build uses Python 3 and installs `dmgbuild` in a local virtual environment on first use. Pulse reads the appcast from the latest stable release. Keep the ZIP and appcast as generated so their signatures remain valid.
 

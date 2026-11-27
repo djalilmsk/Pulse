@@ -51,11 +51,13 @@ if [[ ${1:-} == --release ]]; then
 
     version="$(plutil -extract CFBundleShortVersionString raw "$app/Contents/Info.plist")"
     zip="Pulse-$version-macos-$arch.zip"
+    dmg="Pulse-$version-macos-$arch.dmg"
     release="$(mktemp -d "$PWD/dist/release.XXXXXX")"
     ditto -c -k --sequesterRsrc --keepParent "$app" "$release/$zip"
     "$sparkle/bin/generate_appcast" --account org.pulse.updates --maximum-deltas 0 \
         --download-url-prefix "https://github.com/djalilmsk/Pulse/releases/download/v$version/" \
         --link "https://github.com/djalilmsk/Pulse/releases/tag/v$version" \
         -o "$release/appcast.xml" "$release"
-    printf 'Release assets:\n%s\n%s\n' "$release/$zip" "$release/appcast.xml"
+    scripts/build-dmg.sh "$app" "$release/$dmg"
+    printf 'Release assets:\n%s\n%s\n%s\n' "$release/$zip" "$release/$dmg" "$release/appcast.xml"
 fi

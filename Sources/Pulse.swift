@@ -2657,6 +2657,7 @@ private let dashboardHeaderFade = LinearGradient(stops: [
 ], startPoint: .top, endPoint: .bottom)
 
 struct Dashboard: View {
+    @ObservedObject private var updates = PulseUpdates.shared
     @State private var showingRefreshDetails = false
     @State private var hoveringRefreshStatus = false
     @State private var showingAbout = false
@@ -2768,7 +2769,6 @@ struct Dashboard: View {
                 .foregroundStyle(.secondary)
 
             HStack {
-                Button("Check for Updates…") { PulseUpdates.controller.checkForUpdates(nil) }
                 Spacer()
                 Button("Done") { showingAbout = false }
                     .keyboardShortcut(.defaultAction)
@@ -2783,6 +2783,20 @@ struct Dashboard: View {
         let checking = !state.pending.isEmpty
         return HStack(spacing: 10) {
             PulseWordmark()
+            if updates.isUpdateAvailable {
+                Button {
+                    updates.controller.checkForUpdates(nil)
+                } label: {
+                    Label("New update", systemImage: "arrow.up")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Color.black)
+                        .padding(.horizontal, 10)
+                        .frame(height: 25)
+                        .background(Color.white, in: Capsule())
+                }
+                .buttonStyle(.plain)
+                .help("Open the Pulse update")
+            }
             Spacer()
             Button {
                 showingRefreshDetails.toggle()
@@ -4422,14 +4436,32 @@ private final class T3UsageTracker {
 }
 
 @MainActor
-private enum PulseUpdates {
-    static let controller = SPUStandardUpdaterController(startingUpdater: true,
-                                                         updaterDelegate: nil, userDriverDelegate: nil)
+private final class PulseUpdates: NSObject, ObservableObject, @preconcurrency SPUStandardUserDriverDelegate {
+    static let shared = PulseUpdates()
+    @Published private(set) var isUpdateAvailable = false
+    lazy var controller = SPUStandardUpdaterController(startingUpdater: true,
+                                                       updaterDelegate: nil, userDriverDelegate: self)
+
+    var supportsGentleScheduledUpdateReminders: Bool { true }
+
+    func standardUserDriverShouldHandleShowingScheduledUpdate(_ update: SUAppcastItem,
+                                                              andInImmediateFocus immediateFocus: Bool) -> Bool {
+        false
+    }
+
+    func standardUserDriverWillHandleShowingUpdate(_ handleShowingUpdate: Bool, forUpdate update: SUAppcastItem,
+                                                   state: SPUUserUpdateState) {
+        isUpdateAvailable = true
+    }
+
+    func standardUserDriverWillFinishUpdateSession() {
+        isUpdateAvailable = false
+    }
 }
 
 final class PulseAppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
-        _ = PulseUpdates.controller
+        _ = PulseUpdates.shared.controller
         PulseDock.apply(UserDefaults.standard.bool(forKey: PulseDock.preferenceKey))
         PulseScreenPrivacy.apply(UserDefaults.standard.bool(forKey: PulseScreenPrivacy.preferenceKey))
         NotificationCenter.default.addObserver(self, selector: #selector(applyWindowPrivacy),
@@ -4698,7 +4730,7 @@ struct Pulse: App {
         .windowResizability(.contentSize)
         .commands {
             CommandGroup(after: .appInfo) {
-                Button("Check for Updates…") { PulseUpdates.controller.checkForUpdates(nil) }
+                Button("Check for Updates…") { PulseUpdates.shared.controller.checkForUpdates(nil) }
             }
         }
     }

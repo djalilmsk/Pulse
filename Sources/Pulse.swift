@@ -5,6 +5,7 @@ import Combine
 import Charts
 import CoreText
 import QuartzCore
+import Sparkle
 import SwiftUI
 import UserNotifications
 
@@ -2323,33 +2324,56 @@ final class DashboardState: ObservableObject {
 
 struct QuotaRows: Layout {
     private let minimumWidth: CGFloat = 144
+    private let maximumColumns = 5
     private let spacing: CGFloat = 7
 
     func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
-        let idealWidth = minimumWidth * CGFloat(subviews.count) + spacing * CGFloat(max(0, subviews.count - 1))
+        let idealColumns = min(subviews.count, maximumColumns)
+        let idealWidth = minimumWidth * CGFloat(idealColumns) + spacing * CGFloat(max(0, idealColumns - 1))
         let width = proposal.width.flatMap { $0.isFinite ? $0 : nil } ?? idealWidth
-        let columns = columnCount(width: width, count: subviews.count)
-        let rowCount = (subviews.count + columns - 1) / columns
+        let rows = rowCount(width: width, count: subviews.count)
         let height = subviews.first?.sizeThatFits(.unspecified).height ?? 0
-        return CGSize(width: width, height: CGFloat(rowCount) * height + CGFloat(max(0, rowCount - 1)) * spacing)
+        return CGSize(width: width, height: CGFloat(rows) * height + CGFloat(max(0, rows - 1)) * spacing)
     }
 
     func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
-        let columns = columnCount(width: bounds.width, count: subviews.count)
+        guard !subviews.isEmpty else { return }
+        let rows = rowCount(width: bounds.width, count: subviews.count)
+        let cardsPerRow = subviews.count / rows
+        let extraCards = subviews.count % rows
+        let balancedColumns = cardsPerRow + (extraCards > 0 ? 1 : 0)
+        let capacity = columnCapacity(width: bounds.width)
+        let columns = rows > 2 ? capacity : balancedColumns
+        let width = (bounds.width - CGFloat(columns - 1) * spacing) / CGFloat(columns)
         let height = subviews.first?.sizeThatFits(.unspecified).height ?? 0
-        for (index, subview) in subviews.enumerated() {
-            let row = index / columns
-            let count = min(columns, subviews.count - row * columns)
-            let width = (bounds.width - CGFloat(count - 1) * spacing) / CGFloat(count)
-            let x = bounds.minX + CGFloat(index % columns) * (width + spacing)
+        var index = subviews.startIndex
+        var remaining = subviews.count
+        for row in 0..<rows {
+            // Keep earlier rows full where possible, while leaving at least three cards per row.
+            let count = rows > 2
+                ? min(columns, remaining - (rows - row - 1) * min(3, cardsPerRow))
+                : cardsPerRow + (row < extraCards ? 1 : 0)
+            remaining -= count
+            let rowWidth = CGFloat(count) * width + CGFloat(count - 1) * spacing
+            let startX = bounds.midX - rowWidth / 2
             let y = bounds.minY + CGFloat(row) * (height + spacing)
-            subview.place(at: CGPoint(x: x, y: y), anchor: .topLeading,
-                          proposal: ProposedViewSize(width: width, height: height))
+            for column in 0..<count {
+                let x = startX + CGFloat(column) * (width + spacing)
+                subviews[index].place(at: CGPoint(x: x, y: y), anchor: .topLeading,
+                                      proposal: ProposedViewSize(width: width, height: height))
+                subviews.formIndex(after: &index)
+            }
         }
     }
 
-    private func columnCount(width: CGFloat, count: Int) -> Int {
-        max(1, min(count, Int((width + spacing) / (minimumWidth + spacing))))
+    private func rowCount(width: CGFloat, count: Int) -> Int {
+        let columns = columnCapacity(width: width)
+        return (count + columns - 1) / columns
+    }
+
+    private func columnCapacity(width: CGFloat) -> Int {
+        let fittingColumns = (width + spacing) / (minimumWidth + spacing)
+        return max(1, Int(min(CGFloat(maximumColumns), fittingColumns)))
     }
 }
 
@@ -2744,6 +2768,7 @@ struct Dashboard: View {
                 .foregroundStyle(.secondary)
 
             HStack {
+                Button("Check for Updates…") { PulseUpdates.controller.checkForUpdates(nil) }
                 Spacer()
                 Button("Done") { showingAbout = false }
                     .keyboardShortcut(.defaultAction)
@@ -4396,8 +4421,15 @@ private final class T3UsageTracker {
     }
 }
 
+@MainActor
+private enum PulseUpdates {
+    static let controller = SPUStandardUpdaterController(startingUpdater: true,
+                                                         updaterDelegate: nil, userDriverDelegate: nil)
+}
+
 final class PulseAppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
+        _ = PulseUpdates.controller
         PulseDock.apply(UserDefaults.standard.bool(forKey: PulseDock.preferenceKey))
         PulseScreenPrivacy.apply(UserDefaults.standard.bool(forKey: PulseScreenPrivacy.preferenceKey))
         NotificationCenter.default.addObserver(self, selector: #selector(applyWindowPrivacy),
@@ -4664,7 +4696,11 @@ struct Pulse: App {
         .defaultSize(width: dashboardWidth, height: 700)
         .windowStyle(.hiddenTitleBar)
         .windowResizability(.contentSize)
-
+        .commands {
+            CommandGroup(after: .appInfo) {
+                Button("Check for Updates…") { PulseUpdates.controller.checkForUpdates(nil) }
+            }
+        }
     }
 }
 

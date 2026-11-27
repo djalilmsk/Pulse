@@ -13,12 +13,22 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.10.0</string>
+	<string>1.11.0</string>
 	<key>CFBundleVersion</key>
-	<string>31</string>
+	<string>32</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
 	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>SUFeedURL</key>
+	<string>https://github.com/djalilmsk/Pulse/releases/latest/download/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>W3o4x+ZTlau98cXwYYYo/H6cudV3wexnQefqu+z2B8E=</string>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUVerifyUpdateBeforeExtraction</key>
+	<true/>
+	<key>SURequireSignedFeed</key>
 	<true/>
 </dict>
 </plist>

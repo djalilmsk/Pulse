@@ -6,6 +6,7 @@ import Charts
 import CoreText
 import QuartzCore
 import Sparkle
+import SQLite3
 import SwiftUI
 import UserNotifications
 
@@ -260,35 +261,29 @@ enum T3 {
         let port: Int
     }
 
-    private struct RefreshReply: Decodable {
-        struct Exit: Decodable {
-            let _tag: String
-        }
-
-        let _tag: String
-        let requestId: String?
-        let exit: Exit?
+    static func refreshProviders() async -> Bool {
+        await rpc("server.refreshProviders", payload: [:]) != nil
     }
 
-    static func refreshProviders() async -> Bool {
+    static func rpc(_ tag: String, payload: [String: Any]) async -> Data? {
         guard let data = try? Data(contentsOf: root.appendingPathComponent("userdata/server-runtime.json")),
               let runtime = try? JSONDecoder().decode(Runtime.self, from: data),
               (1...65535).contains(runtime.port),
               let url = URL(string: "ws://127.0.0.1:\(runtime.port)/ws?orchestrationProtocol=2") else {
-            return false
+            return nil
         }
 
         let cli = root.appendingPathComponent("bin/t3")
-        guard FileManager.default.isExecutableFile(atPath: cli.path) else { return false }
+        guard FileManager.default.isExecutableFile(atPath: cli.path) else { return nil }
         let process = Process()
         process.executableURL = cli
         process.arguments = ["auth", "session", "issue", "--base-dir", root.path,
-                             "--scope", "orchestration:read", "--ttl", "5m",
-                             "--label", "Pulse quota refresh", "--token-only"]
+                             "--scope", tag == "server.getUsageSummary" ? "diagnostics:read" : "orchestration:read", "--ttl", "5m",
+                             "--label", "Pulse dashboard", "--token-only"]
         let output = Pipe()
         process.standardOutput = output
         process.standardError = FileHandle.nullDevice
-        do { try process.run() } catch { return false }
+        do { try process.run() } catch { return nil }
         let deadline = DispatchWorkItem { if process.isRunning { process.terminate() } }
         DispatchQueue.global().asyncAfter(deadline: .now() + 20, execute: deadline)
         let bytes = output.fileHandleForReading.readDataToEndOfFile()
@@ -296,7 +291,7 @@ enum T3 {
         deadline.cancel()
         guard process.terminationStatus == 0,
               let token = String(data: bytes, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !token.isEmpty, token.rangeOfCharacter(from: .whitespacesAndNewlines) == nil else { return false }
+              !token.isEmpty, token.rangeOfCharacter(from: .whitespacesAndNewlines) == nil else { return nil }
 
         var request = URLRequest(url: url)
         request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization")
@@ -310,19 +305,24 @@ enum T3 {
             timeout.cancel()
             session.invalidateAndCancel()
         }
+        socket.maximumMessageSize = 32 * 1024 * 1024
         socket.resume()
         do {
-            try await socket.send(.string(#"{"_tag":"Request","id":"0","tag":"server.refreshProviders","payload":{},"headers":[]}"#))
+            let request: [String: Any] = ["_tag": "Request", "id": "0", "tag": tag,
+                                          "payload": payload, "headers": []]
+            let bytes = try JSONSerialization.data(withJSONObject: request)
+            try await socket.send(.string(String(decoding: bytes, as: UTF8.self)))
             while case .string(let message) = try await socket.receive() {
-                if let reply = try? JSONDecoder().decode(RefreshReply.self, from: Data(message.utf8)),
-                   reply._tag == "Exit", reply.requestId == "0" {
-                    return reply.exit?._tag == "Success"
-                }
+                guard let reply = try JSONSerialization.jsonObject(with: Data(message.utf8)) as? [String: Any],
+                      reply["_tag"] as? String == "Exit", reply["requestId"] as? String == "0",
+                      let exit = reply["exit"] as? [String: Any] else { continue }
+                guard exit["_tag"] as? String == "Success" else { return nil }
+                return try JSONSerialization.data(withJSONObject: exit["value"] ?? NSNull(), options: .fragmentsAllowed)
             }
         } catch {
-            return false
+            return nil
         }
-        return false
+        return nil
     }
 
     struct Config: Decodable {
@@ -733,17 +733,73 @@ private struct LocalUsageEvent: Sendable {
     let date: Date
     let provider: String
     let model: String
-    let session: Int
+    let session: String
     let input: Int
     let cached: Int
     let written: Int
     let output: Int
     let cost: Double?
 
+    var unpricedTokens = 0
+
     var tokens: Int { input + cached + written + output }
 }
 
 private enum LocalUsage {
+    struct Report: Decodable {
+        struct Bucket: Decodable {
+            struct Tokens: Decodable {
+                let uncachedInputTokens, cachedInputTokens, cacheCreationTokens, outputTokens: Int
+            }
+            let day, provider, model, costSource: String
+            let hourStart: String?
+            let totals: Tokens
+            let costUsd: Double
+            let unpricedTokens: Int?
+        }
+        struct Source: Decodable {
+            struct Fingerprint: Decodable { let provider: String }
+            let fingerprint: Fingerprint
+            let distinctSessions: Int
+        }
+        let buckets: [Bucket]
+        let sources: [Source]
+    }
+
+    static func live(days: Int, now: Date) async -> (events: [LocalUsageEvent], sessions: [String: Int])? {
+        let calendar = Calendar.current
+        let start = days == 1 ? now.addingTimeInterval(-86400)
+            : calendar.date(byAdding: .day, value: 1 - days, to: calendar.startOfDay(for: now))!
+        let day = DateFormatter()
+        day.locale = Locale(identifier: "en_US_POSIX")
+        day.timeZone = calendar.timeZone
+        day.dateFormat = "yyyy-MM-dd"
+        var payload: [String: Any] = ["sinceDay": day.string(from: start), "untilDay": day.string(from: now),
+                                      "timeZone": calendar.timeZone.identifier, "resolution": days == 1 ? "hour" : "day",
+                                      "awaitRefresh": true]
+        if days == 1 {
+            payload["sinceTime"] = ISO8601DateFormatter().string(from: start)
+            payload["untilTime"] = ISO8601DateFormatter().string(from: now)
+        }
+        guard let data = await T3.rpc("server.getUsageSummary", payload: payload),
+              let report = try? JSONDecoder().decode(Report.self, from: data) else { return nil }
+        func driver(_ name: String) -> String { name == "claude" ? "claudeAgent" : name }
+        var sessions: [String: Int] = [:]
+        for source in report.sources {
+            sessions[driver(source.fingerprint.provider), default: 0] += source.distinctSessions
+        }
+        let events = report.buckets.compactMap { bucket -> LocalUsageEvent? in
+            guard let date = bucket.hourStart.flatMap(parseDate) ?? day.date(from: bucket.day) else { return nil }
+            let tokens = bucket.totals
+            return LocalUsageEvent(date: max(start, date), provider: driver(bucket.provider), model: bucket.model,
+                                   session: "", input: tokens.uncachedInputTokens, cached: tokens.cachedInputTokens,
+                                   written: tokens.cacheCreationTokens, output: tokens.outputTokens,
+                                   cost: bucket.costSource == "unpriced" ? nil : bucket.costUsd,
+                                   unpricedTokens: bucket.unpricedTokens ?? 0)
+        }
+        return (events, sessions)
+    }
+
     private struct Rates: Decodable {
         let input_cost_per_token: Double?
         let cache_read_input_token_cost: Double?
@@ -801,6 +857,186 @@ private enum LocalUsage {
     }
 
     static func read(from directory: URL) throws -> [LocalUsageEvent] {
+        let cached = Result { try readT3Cache(from: directory) }
+        var events = (try? cached.get()) ?? []
+        let cachedProviders = Set(events.map(\.provider))
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let cutoff = Date().addingTimeInterval(-91 * 86_400)
+
+        // Prefer T3's per-provider history once its cache covers that provider.
+        // Native logs can contain the same sessions under different identifiers.
+        if !cachedProviders.contains("antigravity") {
+            events += antigravityUsage(home: home, t3Data: directory, cutoff: cutoff)
+        }
+        if !cachedProviders.contains("opencode") {
+            events += openCodeUsage(home: home, cutoff: cutoff)
+        }
+        if events.isEmpty { return try cached.get() }
+        return events
+    }
+
+    private static func query(_ file: URL, _ sql: String, binding: Int64? = nil,
+                              row: (OpaquePointer) -> Void) {
+        var database: OpaquePointer?
+        let result = sqlite3_open_v2(file.path, &database, SQLITE_OPEN_READONLY, nil)
+        defer { sqlite3_close(database) }
+        guard result == SQLITE_OK else { return }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK,
+              let statement else { return }
+        defer { sqlite3_finalize(statement) }
+        if let binding { sqlite3_bind_int64(statement, 1, binding) }
+        while sqlite3_step(statement) == SQLITE_ROW { row(statement) }
+    }
+
+    private static func antigravityUsage(home: URL, t3Data: URL, cutoff: Date) -> [LocalUsageEvent] {
+        let gemini = home.appendingPathComponent(".gemini")
+        let profiles = t3Data.appendingPathComponent("providers/antigravity")
+        func entries(_ root: URL) -> [URL] {
+            (try? FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil,
+                                                           options: [.skipsHiddenFiles])) ?? []
+        }
+        let roots = ["antigravity/conversations", "antigravity-cli/conversations", "antigravity"]
+            .map { gemini.appendingPathComponent($0) }
+            + entries(profiles).map { $0.appendingPathComponent("antigravity-acp/conversations") }
+        let files = Set(roots.flatMap(entries).filter { $0.pathExtension == "db" }.map { $0.resolvingSymlinksInPath() })
+        var seenRows: Set<String> = []
+        var seenResponses: Set<String> = []
+        var events: [LocalUsageEvent] = []
+        let now = Date()
+        for file in files.sorted(by: { $0.path < $1.path }) {
+            let session = "antigravity:" + file.deletingPathExtension().lastPathComponent
+            query(file, """
+                SELECT idx, data FROM gen_metadata
+                WHERE typeof(data) = 'blob' AND length(data) <= 65536 ORDER BY idx
+                """) { statement in
+                let index = sqlite3_column_int64(statement, 0)
+                let rowKey = session + ":" + String(index)
+                guard !seenRows.contains(rowKey), let generation = protobufColumn(statement, 1),
+                      let chat = generation.message(1), let usage = chat.message(4),
+                      let input = usage.count(2), let cached = usage.count(5),
+                      let text = usage.count(9), let reasoning = usage.count(10),
+                      input + cached + text + reasoning > 0 else { return }
+
+                // Field 1 is the model enum. Fields 9 and 10 are separate output buckets.
+                var date = chat.message(9)?.message(4)?.timestamp
+                if date == nil, let stepID = generation.string(4), let bot = usage.string(7) {
+                    query(file, "SELECT metadata FROM steps WHERE idx = ? AND length(metadata) <= 65536",
+                          binding: index) { step in
+                        guard let metadata = protobufColumn(step, 0), metadata.string(12) == stepID,
+                              metadata.message(9)?.string(7) == bot else { return }
+                        date = metadata.message(1)?.timestamp
+                    }
+                }
+                guard let date, date >= cutoff, date <= now else { return }
+                if let response = usage.string(11),
+                   !seenResponses.insert(session + ":" + response).inserted { return }
+                seenRows.insert(rowKey)
+                events.append(LocalUsageEvent(date: date, provider: "antigravity",
+                    model: chat.string(19) ?? chat.string(21) ?? "Unknown model", session: session,
+                    input: input, cached: cached, written: 0, output: text + reasoning, cost: nil))
+            }
+        }
+        return events
+    }
+
+    private static func openCodeUsage(home: URL, cutoff: Date) -> [LocalUsageEvent] {
+        let dataRoot = ProcessInfo.processInfo.environment["XDG_DATA_HOME"]
+            .flatMap { $0.hasPrefix("/") ? URL(fileURLWithPath: $0) : nil }
+            ?? home.appendingPathComponent(".local/share")
+        let file = dataRoot.appendingPathComponent("opencode/opencode.db")
+        var events: [LocalUsageEvent] = []
+        query(file, """
+            SELECT time_created, session_id, json_extract(data, '$.modelID'),
+                   json_extract(data, '$.tokens.input'), json_extract(data, '$.tokens.cache.read'),
+                   json_extract(data, '$.tokens.cache.write'), json_extract(data, '$.tokens.output'),
+                   json_extract(data, '$.tokens.reasoning')
+            FROM message WHERE time_created >= ? AND json_valid(data)
+            AND json_extract(data, '$.role') = 'assistant'
+            """, binding: Int64(cutoff.timeIntervalSince1970 * 1000)) { statement in
+            guard let session = sqlite3_column_text(statement, 1) else { return }
+            let counts = (3...7).map { sqlite3_column_int64(statement, $0) }
+            guard counts.allSatisfy({ (0...Int64(Int32.max)).contains($0) }),
+                  counts.reduce(0, +) > 0 else { return }
+            let model = sqlite3_column_text(statement, 2).map { String(cString: $0) } ?? "Unknown model"
+            events.append(LocalUsageEvent(
+                date: Date(timeIntervalSince1970: Double(sqlite3_column_int64(statement, 0)) / 1000),
+                provider: "opencode", model: model, session: "opencode:" + String(cString: session),
+                input: Int(counts[0]), cached: Int(counts[1]), written: Int(counts[2]),
+                output: Int(counts[3] + counts[4]), cost: nil))
+        }
+        return events
+    }
+
+    private static func protobufColumn(_ statement: OpaquePointer, _ index: Int32) -> ProtoFields? {
+        guard let blob = sqlite3_column_blob(statement, index) else { return nil }
+        return ProtoFields(Data(bytes: blob, count: Int(sqlite3_column_bytes(statement, index))))
+    }
+
+    // Antigravity's conversation databases store generation and step metadata as protobuf.
+    // Schema references: CodexBar docs/antigravity.md and ccusage's Antigravity adapter.
+    private struct ProtoFields {
+        private var integers: [Int: UInt64] = [:]
+        private var messages: [Int: Data] = [:]
+
+        init?(_ data: Data) {
+            var position = data.startIndex
+            func varint() -> UInt64? {
+                var result: UInt64 = 0
+                for shift in stride(from: 0, through: 63, by: 7) {
+                    guard position < data.endIndex else { return nil }
+                    let byte = data[position]
+                    position += 1
+                    guard shift < 63 || byte <= 1 else { return nil }
+                    result |= UInt64(byte & 127) << shift
+                    if byte < 128 { return result }
+                }
+                return nil
+            }
+            while position < data.endIndex {
+                guard let tag = varint(), tag >> 3 > 0, tag >> 3 <= 0x1fffffff else { return nil }
+                let field = Int(tag >> 3)
+                switch tag & 7 {
+                case 0:
+                    guard let value = varint() else { return nil }
+                    integers[field] = value
+                case 1, 5:
+                    let length = tag & 7 == 1 ? 8 : 4
+                    guard length <= data.endIndex - position else { return nil }
+                    position += length
+                case 2:
+                    guard let size = varint(), size <= UInt64(data.endIndex - position) else { return nil }
+                    let end = position + Int(size)
+                    messages[field] = data.subdata(in: position..<end)
+                    position = end
+                default:
+                    return nil
+                }
+            }
+        }
+
+        func message(_ field: Int) -> Self? { messages[field].flatMap(Self.init) }
+
+        func string(_ field: Int) -> String? {
+            guard let bytes = messages[field], let value = String(data: bytes, encoding: .utf8),
+                  !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+            return value
+        }
+
+        func count(_ field: Int) -> Int? {
+            let value = integers[field] ?? 0
+            guard value <= UInt64(Int32.max) else { return nil }
+            return Int(value)
+        }
+
+        var timestamp: Date? {
+            guard let seconds = integers[1], (1...253_402_300_799).contains(seconds),
+                  (integers[2] ?? 0) < 1_000_000_000 else { return nil }
+            return Date(timeIntervalSince1970: Double(seconds) + Double(integers[2] ?? 0) / 1_000_000_000)
+        }
+    }
+
+    private static func readT3Cache(from directory: URL) throws -> [LocalUsageEvent] {
         let decoder = JSONDecoder()
         let file = directory.appendingPathComponent("usage-scan-cache-v17.json")
         let cache = try decoder.decode(Cache.self, from: Data(contentsOf: file))
@@ -819,7 +1055,7 @@ private enum LocalUsage {
                 let estimate = rates[model]?.estimate(input: row.input, cached: row.cached,
                                                        written: row.written, output: row.output)
                 events.append(LocalUsageEvent(date: Date(timeIntervalSince1970: row.timestamp / 1000),
-                    provider: provider, model: model, session: row.session, input: row.input, cached: row.cached,
+                    provider: provider, model: model, session: provider + ":" + String(row.session), input: row.input, cached: row.cached,
                     written: row.written, output: row.output, cost: estimate))
             }
         }
@@ -1073,7 +1309,7 @@ private struct UsageDashboard: View {
         var output = 0
         var estimatedCost = 0.0
         var pricedTokens = 0
-        var sessions: Set<Int> = []
+        var sessions: Set<String> = []
 
         mutating func add(_ event: LocalUsageEvent) {
             tokens += event.tokens
@@ -1084,7 +1320,7 @@ private struct UsageDashboard: View {
             sessions.insert(event.session)
             if let cost = event.cost {
                 estimatedCost += cost
-                pricedTokens += event.tokens
+                pricedTokens += event.tokens - event.unpricedTokens
             }
         }
 
@@ -1123,7 +1359,8 @@ private struct UsageDashboard: View {
     @Environment(\.dismiss) private var dismiss
     @State private var events: [LocalUsageEvent] = []
     @State private var metric = Metric.tokens
-    @State private var period = Period.month
+    @State private var period = Period.quarter
+    @State private var liveSessions: [String: Int]?
     @State private var provider = ""
     @State private var summary = Summary()
     @State private var activeDate: Date?
@@ -1133,7 +1370,14 @@ private struct UsageDashboard: View {
     @State private var now = Date()
     @State private var hoveringShowAll = false
 
-    private var providerOptions: [String] { Set(events.map(\.provider)).sorted() }
+    private var sessionCount: Int {
+        guard let liveSessions else { return summary.total.sessions.count }
+        return provider.isEmpty ? liveSessions.values.reduce(0, +) : liveSessions[provider, default: 0]
+    }
+
+    private var providerOptions: [String] {
+        Set(events.map(\.provider)).union(state.orderedDrivers).sorted()
+    }
     private var chartUnit: Calendar.Component { period == .day ? .hour : .day }
     private var chartTitle: String {
         (period == .day ? "Hourly " : "Daily ") + (metric == .cost ? "estimated API cost" : "token activity")
@@ -1147,7 +1391,7 @@ private struct UsageDashboard: View {
             } else {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 18) {
-                        if !events.isEmpty { filters }
+                        if !providerOptions.isEmpty { filters }
                         if loading {
                             ProgressView("Reading local usage…")
                                 .padding(56)
@@ -1156,15 +1400,18 @@ private struct UsageDashboard: View {
                             emptyCard(
                                 title: "Local usage unavailable",
                                 systemImage: "externaldrive",
-                                description: "Open Usage in T3 Code to update its local cache, then refresh here."
+                                description: "Pulse found no readable token history from T3 Code or supported provider logs. Open Usage in T3 Code to refresh its cache, then try again."
                             )
                         } else if summary.total.tokens == 0 || (metric == .cost && summary.total.pricedTokens == 0) {
                             emptyCard(
-                                title: metric == .cost && summary.total.tokens > 0 ? "No pricing for these models" : "No activity in this range",
+                                title: metric == .cost && summary.total.tokens > 0 ? "No pricing for these models"
+                                    : provider.isEmpty ? "No activity in this range" : "No recorded activity for " + T3.providerName(provider),
                                 systemImage: "chart.bar.xaxis",
                                 description: metric == .cost && summary.total.tokens > 0
                                     ? "Switch to Tokens to see the recorded activity."
-                                    : "Try a longer date range or choose All providers."
+                                    : !provider.isEmpty && !events.contains(where: { $0.provider == provider })
+                                        ? "Pulse has no local token records for this provider."
+                                        : "Try a longer date range or choose All providers."
                             )
                         } else {
                             overview
@@ -1186,8 +1433,7 @@ private struct UsageDashboard: View {
         .frame(width: 900, height: 640)
         .background(dashboardSurface)
         .presentationBackground(dashboardSurface)
-        .task { await load() }
-        .onChange(of: period) { summarize() }
+        .task(id: period) { await load() }
         .onChange(of: provider) { summarize() }
         .onChange(of: metric) { summarize() }
     }
@@ -1228,7 +1474,7 @@ private struct UsageDashboard: View {
                     .buttonStyle(.plain)
                     .disabled(loading)
                     .accessibilityLabel("Reload local usage")
-                    .help("Reload the local T3 Code usage cache")
+                    .help("Reload local token history")
 
                     Button {
                         dismiss()
@@ -1273,16 +1519,16 @@ private struct UsageDashboard: View {
                 }
                 Spacer()
                 VStack(alignment: .trailing, spacing: 3) {
-                    Text("\(summary.total.sessions.count.formatted()) sessions")
+                    Text("\(sessionCount.formatted()) sessions")
                         .font(.subheadline.weight(.medium))
                         .monospacedDigit()
                     if metric == .cost {
-                        Text("Standard model rates")
+                        Text(liveSessions == nil ? "Local fallback estimate" : "T3 Code API estimate")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .help("Estimated from token counts and the local T3 Code rate catalog. Your subscription bill can differ.")
                     } else {
-                        Text("Recorded on this Mac")
+                        Text(liveSessions == nil ? "Local fallback history" : "T3 Code usage")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -1540,7 +1786,7 @@ private struct UsageDashboard: View {
                 }
             }
             .background(Color.white.opacity(0.045), in: .rect(cornerRadius: 12))
-            Text("Source: T3 Code’s local usage cache")
+            Text("Sources: T3 Code’s local usage cache and supported provider logs")
                 .font(.caption)
                 .foregroundStyle(.tertiary)
                 .padding(.leading, 2)
@@ -1589,15 +1835,30 @@ private struct UsageDashboard: View {
 
     private func load() async {
         loading = true
+        let requestedAt = Date()
+        if let report = await LocalUsage.live(days: period.rawValue, now: requestedAt) {
+            guard !Task.isCancelled else { return }
+            events = report.events
+            liveSessions = report.sessions
+            now = requestedAt
+            loadFailed = false
+            summarize()
+            loading = false
+            return
+        }
+        guard !Task.isCancelled else { return }
         let directory = T3.root.appendingPathComponent("userdata", isDirectory: true)
         let result = await Task.detached(priority: .userInitiated) { Result { try LocalUsage.read(from: directory) } }.value
+        guard !Task.isCancelled else { return }
+        liveSessions = nil
         switch result {
         case .success(let records):
             events = records
             if !providerOptions.contains(provider) { provider = "" }
             loadFailed = false
         case .failure:
-            loadFailed = events.isEmpty
+            events = []
+            loadFailed = true
         }
         now = Date()
         summarize()

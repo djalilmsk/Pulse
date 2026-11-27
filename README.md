@@ -20,9 +20,9 @@ With Xcode Command Line Tools installed, run `./scripts/build.sh` and open `dist
 
 ## Updates
 
-Pulse checks for updates automatically. Use **Check for Updates…** in the Pulse menu or in **About Pulse** to check immediately. Install the first updater-enabled release manually if you're using an older version.
+Pulse checks for updates automatically. When an update is available, **New update** appears next to the Pulse logo in the dashboard. Use **Check for Updates…** in the Pulse menu to check immediately. Install the first updater-enabled release manually if you're using an older version.
 
-For each release, increment both version fields in `Resources/Info.plist` and run `./scripts/build.sh --release`. Upload the generated ZIP and `appcast.xml` together to the matching stable GitHub release, such as `v1.11.0`. Pulse reads the appcast from the latest stable release. Keep the ZIP and appcast as generated so their signatures remain valid.
+For each release, increment both version fields in `Resources/Info.plist` and run `./scripts/build.sh --release`. Upload the generated DMG, ZIP, and `appcast.xml` together to the matching stable GitHub release, such as `v1.11.0`. The DMG build uses Python 3 and installs `dmgbuild` in a local virtual environment on first use. Pulse reads the appcast from the latest stable release. Keep the ZIP and appcast as generated so their signatures remain valid.
 
 Release builds use ad-hoc signing. Sparkle verifies the signed feed and ZIP using the public key bundled with Pulse. Release packaging uses the matching private key in the release Mac's Keychain under the Sparkle account `org.pulse.updates`. Keep a secure backup of that key for future releases.
 

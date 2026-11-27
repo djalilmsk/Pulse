@@ -4697,11 +4697,27 @@ private final class T3UsageTracker {
 }
 
 @MainActor
-private final class PulseUpdates: NSObject, ObservableObject, @preconcurrency SPUStandardUserDriverDelegate {
+private final class PulseUpdates: NSObject, ObservableObject, SPUUpdaterDelegate, @preconcurrency SPUStandardUserDriverDelegate {
     static let shared = PulseUpdates()
     @Published private(set) var isUpdateAvailable = false
     lazy var controller = SPUStandardUpdaterController(startingUpdater: true,
-                                                       updaterDelegate: nil, userDriverDelegate: self)
+                                                       updaterDelegate: self, userDriverDelegate: self)
+
+    func startChecking() {
+        let updater = controller.updater
+        if updater.automaticallyChecksForUpdates {
+            updater.checkForUpdateInformation()
+        }
+        Task {
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(60))
+                guard !Task.isCancelled else { return }
+                if updater.automaticallyChecksForUpdates {
+                    updater.checkForUpdateInformation()
+                }
+            }
+        }
+    }
 
     var supportsGentleScheduledUpdateReminders: Bool { true }
 
@@ -4710,19 +4726,18 @@ private final class PulseUpdates: NSObject, ObservableObject, @preconcurrency SP
         false
     }
 
-    func standardUserDriverWillHandleShowingUpdate(_ handleShowingUpdate: Bool, forUpdate update: SUAppcastItem,
-                                                   state: SPUUserUpdateState) {
+    func updater(_ updater: SPUUpdater, didFindValidUpdate item: SUAppcastItem) {
         isUpdateAvailable = true
     }
 
-    func standardUserDriverWillFinishUpdateSession() {
+    func updaterDidNotFindUpdate(_ updater: SPUUpdater, error: any Error) {
         isUpdateAvailable = false
     }
 }
 
 final class PulseAppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
-        _ = PulseUpdates.shared.controller
+        PulseUpdates.shared.startChecking()
         PulseDock.apply(UserDefaults.standard.bool(forKey: PulseDock.preferenceKey))
         PulseScreenPrivacy.apply(UserDefaults.standard.bool(forKey: PulseScreenPrivacy.preferenceKey))
         NotificationCenter.default.addObserver(self, selector: #selector(applyWindowPrivacy),

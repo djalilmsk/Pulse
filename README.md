@@ -14,6 +14,8 @@ A small macOS dashboard and menu-bar companion for the subscription accounts you
 
 Pulse discovers enabled T3 Code accounts, including Codex, Claude, Cursor, OpenCode, Muse Code, Pi, Antigravity, and Grok. Other configured providers can also appear. Pulse displays the quota windows T3 Code publishes in its local cache. Accounts without quota data show unavailable readings. Pulse uses the installed `codex` and `agy` CLIs for direct quota refreshes. It also tries `muse usage --json` for the default local Muse Code account, with T3 Code as a fallback. For other enabled providers, Pulse asks the running local T3 Code server to refresh at startup, every five minutes, and on manual refresh. This path requires the T3 CLI and a running local T3 Code server. Pulse can still display cached readings when the server is unavailable. Antigravity’s CLI is launched with a temporary copy of the selected local T3 sign-in. Pulse makes no direct provider HTTP requests. This is an unofficial integration, and provider or CLI changes can affect availability.
 
+The Tokens and API cost views request the selected period’s usage summary from the running T3 Code server, including its provider totals, distinct session counts, and pricing. When the server is unavailable, Pulse combines T3 Code’s local usage cache with recorded token history from Antigravity and OpenCode when the cache lacks that provider. Antigravity history includes local desktop, CLI, and T3-managed profiles. Other configured providers appear in the filter and show an empty state if Pulse has no token records for them.
+
 ## Build
 
 With Xcode Command Line Tools installed, run `./scripts/build.sh` and open `dist/Pulse.app`. The build downloads and verifies the pinned Sparkle framework on first use.
